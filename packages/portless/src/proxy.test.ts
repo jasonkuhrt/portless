@@ -415,7 +415,8 @@ describe("createProxyServer", () => {
         },
       });
       expect(res.status).toBe(200);
-      expect(received.connection).toBe("close");
+      // The proxy's own pool declares the upstream connection.
+      expect(received.connection).toBe("keep-alive");
       expect(received["keep-alive"]).toBeUndefined();
       expect(received["proxy-connection"]).toBeUndefined();
       expect(received.upgrade).toBeUndefined();

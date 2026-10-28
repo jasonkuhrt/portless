@@ -57,6 +57,48 @@ const HOP_BY_HOP_HEADERS = new Set([
 const REQUEST_HOP_BY_HOP_HEADERS = ["connection", "keep-alive", "proxy-connection", "upgrade"];
 
 /**
+ * Upstream connections per backend port for plain requests. An HTTP/2 page
+ * load multiplexes hundreds of module requests onto one client connection.
+ * Dialed one connection each, they overflow a busy dev server's accept queue
+ * (128 on macOS) and the surplus connects are reset. Above this many in
+ * flight, requests wait for a free connection instead.
+ */
+const UPSTREAM_MAX_SOCKETS = 32;
+
+/**
+ * How long an idle upstream connection stays pooled: under Node's 5 s server
+ * keep-alive timeout, so the proxy retires a connection before a Node backend
+ * closes it. Setting it also makes Node's Agent honour a shorter
+ * `Keep-Alive: timeout` hint from the backend.
+ */
+const UPSTREAM_IDLE_TIMEOUT_MS = 4_000;
+
+/** A keep-alive pool that dials one backend port on loopback. */
+class UpstreamAgent extends http.Agent {
+  constructor(private readonly port: number) {
+    super({
+      keepAlive: true,
+      maxSockets: UPSTREAM_MAX_SOCKETS,
+      timeout: UPSTREAM_IDLE_TIMEOUT_MS,
+    });
+  }
+
+  // Dial via createLoopbackConnection so ::1-only backends work too.
+  override createConnection(): net.Socket {
+    return createLoopbackConnection(this.port);
+  }
+
+  get idle(): boolean {
+    return (
+      Object.keys(this.sockets).length +
+        Object.keys(this.freeSockets).length +
+        Object.keys(this.requests).length ===
+      0
+    );
+  }
+}
+
+/**
  * Get the effective host value from a request.
  * HTTP/2 uses the :authority pseudo-header; HTTP/1.1 uses Host.
  */
@@ -303,6 +345,22 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
   const tldSuffixes = [...new Set(tlds.length > 0 ? tlds : [tld])].map((value) => `.${value}`);
   const primaryTldSuffix = tldSuffixes[0] ?? ".localhost";
 
+  // Plain requests reuse one pool per backend port. WebSocket upgrades dial
+  // their own connections: they are few, long-lived, and must not hold a slot.
+  const upstreamAgents = new Map<number, UpstreamAgent>();
+  const upstreamAgent = (port: number): UpstreamAgent => {
+    const existing = upstreamAgents.get(port);
+    if (existing) return existing;
+    // Apps restart on new ports, so retire the pools that went quiet rather
+    // than keep one per port the proxy has ever served.
+    for (const [quietPort, quiet] of upstreamAgents) {
+      if (quiet.idle) upstreamAgents.delete(quietPort);
+    }
+    const agent = new UpstreamAgent(port);
+    upstreamAgents.set(port, agent);
+    return agent;
+  };
+
   const handleRequest = (req: http.IncomingMessage, res: http.ServerResponse) => {
     const reqTls = isEncrypted(req);
     res.setHeader(PORTLESS_HEADER, "1");
@@ -449,56 +507,95 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
       proxyReqHeaders.host = getRequestHost(req);
     }
 
-    const proxyReq = http.request(
-      {
-        // Dial via createLoopbackConnection so ::1-only backends work too.
-        createConnection: () => createLoopbackConnection(route.port),
-        path: req.url,
-        method: req.method,
-        headers: proxyReqHeaders,
-      },
-      (proxyRes) => {
-        const responseHeaders: http.OutgoingHttpHeaders = { ...proxyRes.headers };
-        if (reqTls) {
-          for (const h of HOP_BY_HOP_HEADERS) {
-            delete responseHeaders[h];
-          }
-        }
-        res.writeHead(proxyRes.statusCode || 502, responseHeaders);
-        proxyRes.on("error", () => {
-          if (!res.headersSent) {
-            res.writeHead(502, { "Content-Type": "text/plain" });
-            res.end();
-          } else {
-            // Headers already sent (mid-stream): destroy instead of end to
-            // send RST_STREAM. Calling res.end() here can cause a
-            // content-length mismatch that Chrome treats as a session error.
-            res.destroy();
-          }
-        });
-        proxyRes.pipe(res);
-      }
-    );
+    // A backend closes an idle keep-alive connection on its own schedule, so
+    // a request can land on one it has just closed: Node then fails it with
+    // ECONNRESET or EPIPE before any response, on a `reusedSocket`. A GET or
+    // HEAD without a body is safe to send again, once, on a new connection.
+    const resendable =
+      (req.method === "GET" || req.method === "HEAD") &&
+      (req.headers["content-length"] ?? "0") === "0" &&
+      req.headers["transfer-encoding"] === undefined;
 
-    proxyReq.on("error", (err) => {
-      req.unpipe(proxyReq);
-      req.resume();
-      onError(`Proxy error for ${getRequestHost(req)}: ${err.message}`);
-      if (!res.headersSent) {
-        const errWithCode = err as NodeJS.ErrnoException;
-        const detail =
-          errWithCode.code === "ECONNREFUSED"
-            ? "The target app is not responding. It may have crashed."
-            : "The target app may not be running.";
-        sendProxyError(req, res, 502, "bad_gateway", detail, getRequestHost(req), () =>
-          renderPage(
-            502,
-            "Bad Gateway",
-            `<div class="content"><p class="desc">${escapeHtml(detail)}</p></div>`
-          )
-        );
-      }
-    });
+    const forward = (fresh: boolean): http.ClientRequest => {
+      let answered = false;
+      const attempt = http.request(
+        {
+          path: req.url,
+          method: req.method,
+          ...(fresh
+            ? {
+                createConnection: () => createLoopbackConnection(route.port),
+                headers: { ...proxyReqHeaders, connection: "close" },
+              }
+            : { agent: upstreamAgent(route.port), headers: proxyReqHeaders }),
+        },
+        (proxyRes) => {
+          answered = true;
+          const responseHeaders: http.OutgoingHttpHeaders = { ...proxyRes.headers };
+          if (reqTls) {
+            for (const h of HOP_BY_HOP_HEADERS) {
+              delete responseHeaders[h];
+            }
+          }
+          res.writeHead(proxyRes.statusCode || 502, responseHeaders);
+          proxyRes.on("error", () => {
+            if (!res.headersSent) {
+              res.writeHead(502, { "Content-Type": "text/plain" });
+              res.end();
+            } else {
+              // Headers already sent (mid-stream): destroy instead of end to
+              // send RST_STREAM. Calling res.end() here can cause a
+              // content-length mismatch that Chrome treats as a session error.
+              res.destroy();
+            }
+          });
+          proxyRes.on("end", () => {
+            // The backend answered before the whole upload was forwarded (a
+            // 413 from Content-Length, an auth rejection). The connection is
+            // mid-body and cannot be reused: drop it, and discard the rest of
+            // the client's upload so its next request can proceed.
+            if (!attempt.writableFinished) {
+              req.unpipe(attempt);
+              req.resume();
+              attempt.destroy();
+            }
+          });
+          proxyRes.pipe(res);
+        }
+      );
+
+      attempt.on("error", (err: NodeJS.ErrnoException) => {
+        req.unpipe(attempt);
+        if (
+          !fresh &&
+          resendable &&
+          attempt.reusedSocket &&
+          !answered &&
+          (err.code === "ECONNRESET" || err.code === "EPIPE")
+        ) {
+          proxyReq = forward(true);
+          proxyReq.end();
+          return;
+        }
+        req.resume();
+        onError(`Proxy error for ${getRequestHost(req)}: ${err.message}`);
+        if (!res.headersSent) {
+          const detail =
+            err.code === "ECONNREFUSED"
+              ? "The target app is not responding. It may have crashed."
+              : "The target app may not be running.";
+          sendProxyError(req, res, 502, "bad_gateway", detail, getRequestHost(req), () =>
+            renderPage(
+              502,
+              "Bad Gateway",
+              `<div class="content"><p class="desc">${escapeHtml(detail)}</p></div>`
+            )
+          );
+        }
+      });
+      return attempt;
+    };
+    let proxyReq = forward(false);
 
     // Abort the outgoing request if the client disconnects
     res.on("close", () => {
